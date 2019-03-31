@@ -1,0 +1,160 @@
+#!/usr/bin/env python
+import numpy as np
+import rospy
+import rosnode
+import cvxopt
+import cvxopt.solvers
+from tf.transformations import euler_from_quaternion
+from autoware_msgs.msg import Lane, LaneArray
+from utils import *
+from dynamic_reconfigure.server import Server
+
+class qp_speed_replanner:
+    def __init__(self):
+        self.__app_name = "qp_speed_replanner"
+        self._a_max = rospy.get_param('~a_max', 2.0)
+        self._s_max = rospy.get_param('~s_max', 3.0)
+        self._v_max = rospy.get_param('~v_max', 3.0)
+        self._latacc_max = rospy.get_param('~latacc_max', 2.0)
+        self._tire_angvel_max = rospy.get_param('~tire_angvel_max', 0.5)
+        self._tire_angvel_thr = rospy.get_param('~tire_angvel_thr', 0.1)
+        self._vel_min_for_tire = rospy.get_param('~vel_min_for_tire', 1.0)
+        self._wheelbase = 2.9
+        self._max_iter = rospy.get_param('~max_iter', 20)
+        self._lane_pub = {}
+        self._lane_pub['with_decision'] = rospy.Publisher(
+             "/based/lane_waypoints_array", LaneArray, queue_size=10, latch=True)
+        self._lane_pub['without_decision'] = rospy.Publisher(
+             "lane_waypoints", LaneArray, queue_size=10, latch=True)
+        self._lane_sub = rospy.Subscriber("/based/lane_waypoints_raw",
+                                          LaneArray, self.lane_array_callback)
+        '''self._server = Server("qp_speed_planner",
+                              config_callback=self.config_callback)'''
+        self._lane_array = LaneArray()
+        self._replanning_mode = True
+    
+    def is_decision_maker(self):
+        '''return rosnode.rosnode_ping("/decision_maker",
+                                    max_count=1, verbose=False)'''
+        return "/decision_maker" in rosnode.get_node_names()
+
+    def lane_array_callback(self, data):   
+        self._lane_array = data
+        self.lane_array_publisher()
+    
+    def lane_array_publisher(self):
+        array = self._lane_array
+        if(self._replanning_mode):
+            self.replan(array)
+            if(self.is_decision_maker()):
+                self._lane_pub['with_decision'].publish(array)
+            else:
+                self._lane_pub['without_decision'].publish(array)
+
+    def replan(self, lane_array):
+        cvxopt.solvers.options['abstol'] = 1e-15
+        cvxopt.solvers.options['reltol'] = 1e-15
+        cvxopt.solvers.options['feastol'] = 1e-15
+        for lane in lane_array.lanes:
+            l = len(lane.waypoints)
+            v = np.array(map(lambda wp: wp.twist.twist.linear.x,  
+                         lane.waypoints))
+            v_orig = v.copy()
+            orientation_list = lambda o: [o.x, o.y, o.z, o.w]
+            yaw = np.array(map(lambda wp: 
+                           euler_from_quaternion(
+                           orientation_list(wp.pose.pose.orientation))[2],
+                           lane.waypoints))
+            yaw = convert_euler_to_monotonic(yaw)
+            curvature = calc_waypoints_curvature(lane)
+            waypoints_dist = np.array([dist(lane.waypoints[i],
+                                      lane.waypoints[i+1]) 
+                                      for i in range(l-1)])
+            acc_orig = v[1:l] * np.array(v[1:l] - v[0:l-1]) / waypoints_dist
+            print (acc_orig)
+            jerk_orig = (v[1:l-1] * v[1:l-1]) * \
+                        np.array(v[2:l] - 2.0 * v[1:l-1] + v[0:l-2]) / \
+                        (np.power(waypoints_dist[1:l-1], 2))
+            print (jerk_orig)
+            latacc_orig = curvature * v.reshape((l, 1)) * v.reshape((l, 1))
+            print (latacc_orig)
+            tire_angvel_orig = v[1:l-1] * (yaw[2:l] - 2.0 * yaw[1:l-1] + yaw[0:l-2]) / \
+                               np.power(waypoints_dist[1:l-1], 2) * self._wheelbase
+            print (tire_angvel_orig)
+            A = np.zeros((2, l))
+            A[0, 0] = 1
+            A[1, l-1] = 1
+            b = np.array([v[0], v[l-1]])
+            v_max_arr = np.zeros((l,1))
+            for i in range(l):
+                k = max(np.abs(curvature[i]), 0.0001)
+                v_max_arr[i] = min((self._latacc_max / k) ** 0.5,  
+                                    self._v_max)
+            tire_angvel_tmp = np.zeros((l, 1))
+            for i in range(1, l-1):
+                tire_angvel_tmp[i] = tire_angvel_orig[i-1]
+            tire_angvel_tmp[0] = tire_angvel_orig[0]
+            tire_angvel_tmp[-1] = tire_angvel_orig[-1]
+            v_min_arr = np.zeros((l,1))
+            for i in range(l):
+                if abs(tire_angvel_tmp[i]) > self._tire_angvel_thr:
+                    v_min_arr[i] = self._vel_min_for_tire
+            for j in range(self._max_iter):
+                # velocity constraint
+                G_vel = np.eye(l)
+                G_vel = np.vstack((G_vel, -G_vel))
+                h_vel = np.vstack((v_max_arr, -v_min_arr))
+                G = G_vel
+                h = h_vel
+                # acceleration constraint
+                G_acc = np.zeros((l-1, l))
+                for i in range(l-1):
+                    G_acc[i, i] = -v[i] / waypoints_dist[i]
+                    G_acc[i, i+1] = v[i] / waypoints_dist[i]
+                G_acc = np.vstack((G_acc, -G_acc))
+                h_acc = np.ones((l-1, 1)) * self._a_max
+                h_acc = np.vstack((h_acc, h_acc))
+                G = np.vstack((G, G_acc))
+                h = np.vstack((h, h_acc))
+                # jerk constraint
+                G_jerk = np.zeros((l-2, l))
+                for i in range(l-2):
+                    G_jerk[i, i] = (v[i+1] / waypoints_dist[i+1])**2
+                    G_jerk[i, i+1] = -2.0 * ((v[i+1] / waypoints_dist[i+1])**2)
+                    G_jerk[i, i+2] = (v[i+1] / waypoints_dist[i+1])**2
+                G_jerk = np.vstack((G_jerk, -G_jerk))
+                h_jerk = np.ones((l-2, 1)) * self._s_max
+                h_jerk = np.vstack((h_jerk, h_jerk))
+                G = np.vstack((G, G_jerk))
+                h = np.vstack((h, h_jerk))
+                G_tire = np.zeros((l-2, l))
+                for i in range(l-2):
+                    G_tire[i,i+1] = self._wheelbase * (yaw[i+2] - 2.0*yaw[i+1] + yaw[i]) / (waypoints_dist[i+1]**2)
+                G_tire = np.vstack((G_tire, -G_tire))
+                h_tire = np.ones((l-2,1)) * self._tire_angvel_max
+                h_tire = np.vstack((h_tire, h_tire))
+                G = np.vstack((G, G_tire))
+                h = np.vstack((h, h_tire))
+                # minimize squared error from original velocity
+                P = np.eye(l)
+                q = -np.array(v_orig)
+                cvxopt.solvers.options['show_progress'] = False
+                sol = cvxopt.solvers.qp(cvxopt.matrix(P), cvxopt.matrix(q), 
+                                        G=cvxopt.matrix(G), h=cvxopt.matrix(h), 
+                                        A=cvxopt.matrix(A), b=cvxopt.matrix(b))
+                v = np.array(sol['x'])
+                # cost = sol["primal objective"] + np.dot(v_orig, v_orig)
+            for i, waypoint in enumerate(lane.waypoints):
+                waypoint.twist.twist.linear.x = v[i]
+        return lane_array
+if __name__ == '__main__':
+    try:
+        rospy.init_node("qp_speed_replanner")
+        qsr = qp_speed_replanner()
+        rospy.spin()
+    except rospy.ROSInternalException: 
+        pass
+
+
+
+ 
