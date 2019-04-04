@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+import random
+import matplotlib
+import rospy
+from tf.transformations import euler_from_quaternion
+import numpy as np
+matplotlib.use('Qt5Agg')
+from PyQt5 import QtCore, QtWidgets
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from qp_speed_replanner.cfg import ParamConfig
+from dynamic_reconfigure.server import Server
+from dynamic_reconfigure.client import Client
+from autoware_msgs.msg import Lane, LaneArray
+from utils import *
+
+class ApplicationWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        QtWidgets.QMainWindow.__init__(self)
+        self.main_widget = QtWidgets.QWidget(self)
+        l = QtWidgets.QVBoxLayout(self.main_widget)
+        
+        fig = Figure()
+        self.fc = FigureCanvas(fig)
+        label = ["velocity", "acceleration", "jerk", "lateral acceleration", "tire angular velocity", "velocity threshold"]
+        self.fc.axes = {label[i]:fig.add_subplot(2,3,i+1) for i in range(6)}
+        self.fc.setParent(self.main_widget)
+        FigureCanvas.setSizePolicy(self.fc,
+                                 QtWidgets.QSizePolicy.Expanding,
+                                 QtWidgets.QSizePolicy.Expanding)
+        FigureCanvas.updateGeometry(self.fc)
+        l.addWidget(self.fc)
+        self.setCentralWidget(self.main_widget)
+        #self.server = Server(ParamConfig, self.config_callback)
+        self.client = Client("qp_speed_replanner", timeout=30, config_callback=self.param_callback)
+        self.lane_sub = {}
+        self.lane_sub["src"] = rospy.Subscriber("/based/lane_waypoints_raw",
+                                                LaneArray, self.src_lane_array_callback)
+        self.lane_sub["dst"] = rospy.Subscriber("/lane_waypoints_array",
+                                                LaneArray, self.dst_lane_array_callback)
+        self.src_lane_array = LaneArray()
+        self.dst_lane_array = LaneArray()
+
+    def src_lane_array_callback(self, data):
+        self.src_lane_array = data
+    
+    def dst_lane_array_callback(self, data):
+        self.dst_lane_array = data
+
+    def param_callback(self, config):
+        for src_lane, dst_lane in zip(self.src_lane_array.lanes, self.dst_lane_array.lanes):
+            # plot velocity
+            l = len(src_lane.waypoints)
+            v_orig = np.array(map(lambda wp: wp.twist.twist.linear.x,  
+                              src_lane.waypoints))
+            v_replan = np.array(map(lambda wp: wp.twist.twist.linear.x,  
+                                dst_lane.waypoints))
+            self.fc.axes["velocity"].cla()
+            self.fc.axes["velocity"].set_title("velocity") 
+            self.fc.axes["velocity"].plot(range(len(v_orig)), v_orig, 'r', label="original")
+            
+            self.fc.axes["velocity"].plot(range(len(v_replan)), v_replan, 'b', label="replan") 
+            self.fc.axes["velocity"].plot(range(len(v_replan)), [config["v_max"]]*len(v_replan), 'g', ls="--", label="v_max")
+            self.fc.axes["velocity"].legend()
+
+            # plot acceleration
+            waypoints_dist_orig = np.array([dist(src_lane.waypoints[i],
+                                           src_lane.waypoints[i+1]) 
+                                           for i in range(l-1)])
+            waypoints_dist_replan = np.array([dist(dst_lane.waypoints[i],
+                                             dst_lane.waypoints[i+1]) 
+                                             for i in range(l-1)])
+            acc_orig = v_orig[1:l] * np.array(v_orig[1:l] - v_orig[0:l-1]) / waypoints_dist_orig
+            acc_replan = v_replan[1:l] * np.array(v_replan[1:l] - v_replan[0:l-1]) / waypoints_dist_replan
+            self.fc.axes["acceleration"].cla()
+            self.fc.axes["acceleration"].set_title("acceleration") 
+            self.fc.axes["acceleration"].plot(range(len(acc_orig)), acc_orig, 'r', label="original")
+            self.fc.axes["acceleration"].plot(range(len(acc_replan)), acc_replan, 'b', label="replan") 
+            self.fc.axes["acceleration"].plot(range(len(acc_replan)), [config["a_max"]]*len(acc_replan), 'g', ls="--", label="a_max")
+            self.fc.axes["acceleration"].legend()
+
+            # plot jerk
+            jerk_orig = (v_orig[1:l-1] * v_orig[1:l-1]) * \
+                        np.array(v_orig[2:l] - 2.0 * v_orig[1:l-1] + v_orig[0:l-2]) / \
+                        (np.power(waypoints_dist_orig[1:l-1], 2))
+            
+            jerk_replan = (v_replan[1:l-1] * v_replan[1:l-1]) * \
+                        np.array(v_replan[2:l] - 2.0 * v_replan[1:l-1] + v_replan[0:l-2]) / \
+                        (np.power(waypoints_dist_replan[1:l-1], 2))
+            self.fc.axes["jerk"].cla()
+            self.fc.axes["jerk"].set_title("jerk") 
+            self.fc.axes["jerk"].plot(range(len(jerk_orig)), jerk_orig, 'r', label="original")
+            self.fc.axes["jerk"].plot(range(len(jerk_replan)), jerk_replan, 'b', label="replan") 
+            self.fc.axes["jerk"].plot(range(len(jerk_replan)), [config["s_max"]]*len(jerk_replan), 'g', ls="--", label="s_max")
+            self.fc.axes["jerk"].legend()
+
+            # plot lateral acceleration
+            orientation_list = lambda o: [o.x, o.y, o.z, o.w]
+            yaw_orig = np.array(map(lambda wp: 
+                           euler_from_quaternion(
+                           orientation_list(wp.pose.pose.orientation))[2],
+                           src_lane.waypoints))
+            yaw_orig = convert_euler_to_monotonic(yaw_orig)
+            yaw_replan = np.array(map(lambda wp: 
+                           euler_from_quaternion(
+                           orientation_list(wp.pose.pose.orientation))[2],
+                           dst_lane.waypoints))
+            yaw_replan = convert_euler_to_monotonic(yaw_replan)
+            curvature_orig = calc_waypoints_curvature(src_lane)
+            curvature_replan = calc_waypoints_curvature(dst_lane)
+            latacc_orig = curvature_orig * v_orig.reshape((l, 1)) * v_orig.reshape((l, 1))
+            latacc_replan = curvature_replan * v_replan.reshape((l, 1)) * v_replan.reshape((l, 1))
+            self.fc.axes["lateral acceleration"].cla()
+            self.fc.axes["lateral acceleration"].set_title("lateral acceleration") 
+            self.fc.axes["lateral acceleration"].plot(range(len(latacc_orig)), latacc_orig, 'r', label="original")
+            self.fc.axes["lateral acceleration"].plot(range(len(latacc_replan)), latacc_replan, 'b', label="replan") 
+            self.fc.axes["lateral acceleration"].plot(range(len(latacc_replan)), [config["latacc_max"]]*len(latacc_replan), 'g', ls="--", label="latacc_max")
+            self.fc.axes["lateral acceleration"].legend()
+            # plot tire angular velocity
+            tire_angvel_orig = v_orig[1:l-1] * (yaw_orig[2:l] - 2.0 * yaw_orig[1:l-1] + yaw_orig[0:l-2]) / \
+                               np.power(waypoints_dist_orig[1:l-1], 2) * config["wheelbase"]
+            tire_angvel_replan = v_replan[1:l-1] * (yaw_replan[2:l] - 2.0 * yaw_replan[1:l-1] + yaw_replan[0:l-2]) / \
+                               np.power(waypoints_dist_replan[1:l-1], 2) * config["wheelbase"]
+            self.fc.axes["tire angular velocity"].cla()
+            self.fc.axes["tire angular velocity"].set_title("tire angular velocity") 
+            self.fc.axes["tire angular velocity"].plot(range(len(tire_angvel_orig)), tire_angvel_orig, 'r', label="original")
+            self.fc.axes["tire angular velocity"].plot(range(len(tire_angvel_replan)), tire_angvel_replan, 'b', label="replan") 
+            self.fc.axes["tire angular velocity"].plot(range(len(tire_angvel_replan)), [config["tire_angvel_max"]]*len(tire_angvel_replan), 'g', ls="--", label="tire_angvel_max")
+            self.fc.axes["tire angular velocity"].legend()
+            # velocity threshold
+            tire_angvel_tmp = np.zeros((l, 1))
+            for i in range(1, l-1):
+                tire_angvel_tmp[i] = tire_angvel_orig[i-1]
+            tire_angvel_tmp[0] = tire_angvel_orig[0]
+            tire_angvel_tmp[-1] = tire_angvel_orig[-1]
+            v_min_arr = np.zeros((l,1))
+            for i in range(l):
+                if abs(tire_angvel_tmp[i]) > config["tire_angvel_thr"]:
+                    v_min_arr[i] = config["vel_min_for_tire"]
+            self.fc.axes["velocity threshold"].cla()
+            self.fc.axes["velocity threshold"].set_title("velocity threshold") 
+            self.fc.axes["velocity threshold"].plot(range(len(v_replan)), v_replan, 'r', label="velocity")
+            self.fc.axes["velocity threshold"].plot(range(len(tire_angvel_replan)), tire_angvel_replan, 'b', label="tire angular vel") 
+            self.fc.axes["velocity threshold"].plot(range(len(v_min_arr)), v_min_arr, 'g', ls="--", label="minimum velocity for tire move")
+            self.fc.axes["velocity threshold"].legend()
+        self.fc.draw()
+qApp = QtWidgets.QApplication([])
+rospy.init_node("qp_speed_replanner_plot")
+aw = ApplicationWindow()
+aw.setWindowTitle("qp_speed_replanner_plot")
+aw.show()
+qApp.exec_()
+rospy.spin()
