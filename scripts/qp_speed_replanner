@@ -57,9 +57,8 @@ class qp_speed_replanner:
         array = copy.deepcopy(self._lane_array)
         if(self._replanning_mode):
             self.replan(array)
-            if(self.is_decision_maker()):
-                self._lane_pub['with_decision'].publish(array)
-            else:
+            self._lane_pub['with_decision'].publish(array)
+            if (not self.is_decision_maker()):
                 self._lane_pub['without_decision'].publish(array)
 
     def replan(self, lane_array):

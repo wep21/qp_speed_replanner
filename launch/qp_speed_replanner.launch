@@ -10,7 +10,7 @@
     <arg name="max_iter" default="20"/>
     <arg name="replanning_mode" default="True"/>
 	
-    <node pkg="qp_speed_replanner" name="qp_speed_replanner_node" type="qp_speed_replanner" output="screen">
+    <node pkg="qp_speed_replanner" name="qp_speed_replanner" type="qp_speed_replanner" output="screen">
         <param name="v_max" value="$(arg v_max)"/>
         <param name="a_max" value="$(arg a_max)"/>
         <param name="s_max" value="$(arg s_max)"/>
